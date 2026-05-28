@@ -1152,9 +1152,9 @@ document.querySelectorAll('.nav-tab').forEach(tab => {
 
 // ===== STORAGE HELPERS =====
 const LS_get = (k) => { try { const r = localStorage.getItem(k); return r == null ? null : JSON.parse(r); } catch { return null; } };
-const LS_set = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+let LS_set = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 window.LS_get = LS_get;
-window.LS_set = LS_set;
+window.LS_set = (k, v) => LS_set(k, v);
 
 let exchangeRates = { AUD: 1, CHF: 1, USD: 1, EUR: 1, GBP: 1 };
 (async () => {
@@ -2136,41 +2136,55 @@ function fmtMoney(amountCHF) {
 
 // ===== SUPABASE SYNC ENGINE =====
 (function() {
-  // All localStorage keys we want to sync
   const SYNC_KEYS = [
-    'goals_streak_v1','stack:items','stack:version',
+    'goal_streak_v1','stack:items','stack:version',
     'po_coach_v2','health:entries','health:vo2',
     'nw:bank','nw:stocks','nw:etf','nw:other','nw:subs','nw:wish',
     'cd:v1','study:sessions','study:subjects'
   ];
-  // Also sync dated goal/stack keys dynamically
+
   function getAllSyncKeys() {
-    const extra = [];
-    for (let i=0;i<localStorage.length;i++) {
-      const k=localStorage.key(i);
-      if(k && (k.startsWith('goals:') || k.startsWith('stack:taken:'))) extra.push(k);
+    var extra = [];
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (k && (k.startsWith('goals:') || k.startsWith('stack:taken:'))) extra.push(k);
     }
-    return [...new Set([...SYNC_KEYS,...extra])];
+    return Array.from(new Set(SYNC_KEYS.concat(extra)));
   }
 
-  let supaClient = null;
-  let realtimeSub = null;
-  let syncUid = null;
-  let pushTimer = null;
+  var supaClient = null;
+  var realtimeSub = null;
+  var syncUid = null;
+  var pushTimer = null;
+  var isPulling = false;
 
   function getConfig() { return LS_get('supa:config') || {}; }
 
   function setStatus(state, text) {
-    const el = document.getElementById('supaStatus');
-    const dot = document.getElementById('supaDot');
-    const txt = document.getElementById('supaStatusText');
+    var el = document.getElementById('supaStatus');
+    var dot = document.getElementById('supaDot');
+    var txt = document.getElementById('supaStatusText');
     if (!el) return;
     el.className = 'supa-status ' + state;
-    dot.className = 'supa-dot' + (state==='syncing'?' pulse':'');
+    dot.className = 'supa-dot' + (state === 'syncing' ? ' pulse' : '');
     txt.textContent = text;
   }
 
-  // Lazy-load Supabase SDK only when user actually connects
+  function reRenderAll() {
+    if (typeof renderHealth === 'function') renderHealth();
+    if (typeof renderStudy === 'function') renderStudy();
+    if (typeof renderCountdowns === 'function') renderCountdowns();
+    if (typeof renderAllNetWorth === 'function') renderAllNetWorth();
+    if (typeof renderGym === 'function') renderGym();
+    window.dispatchEvent(new CustomEvent('goals-changed'));
+    if (typeof window._renderStack === 'function') window._renderStack();
+  }
+
+  // Write directly to localStorage, bypassing the push wrapper
+  function lsWriteRaw(k, v) {
+    try { localStorage.setItem(k, JSON.stringify(v)); } catch(e) {}
+  }
+
   function loadSDK() {
     return new Promise(function(resolve, reject) {
       if (typeof supabase !== 'undefined' && supabase.createClient) { resolve(); return; }
@@ -2188,104 +2202,141 @@ function fmtMoney(amountCHF) {
       await loadSDK();
       supaClient = supabase.createClient(url, key);
       syncUid = uid;
-      setStatus('syncing','Connecting…');
-      const { error } = await supaClient.from('dashboard_sync').select('key').eq('user_id',uid).limit(1);
-      if (error) throw error;
-      setStatus('connected','Synced');
+      setStatus('syncing', 'Connecting\u2026');
+      var res = await supaClient.from('dashboard_sync').select('key').eq('user_id', uid).limit(1);
+      if (res.error) throw res.error;
+      setStatus('connected', 'Connected');
       return true;
     } catch(e) {
       console.warn('Supabase init failed:', e.message);
-      setStatus('disconnected','Offline');
+      setStatus('disconnected', 'Offline');
       supaClient = null;
       return false;
     }
   }
 
+  async function pushKey(k) {
+    if (!supaClient || !syncUid) return;
+    var val = LS_get(k);
+    var res = await supaClient.from('dashboard_sync')
+      .upsert([{ user_id: syncUid, key: k, value: val }], { onConflict: 'user_id,key' });
+    if (res.error) console.warn('pushKey error:', k, res.error.message);
+  }
+
   async function pushAll() {
     if (!supaClient || !syncUid) return;
-    setStatus('syncing','Syncing…');
-    const keys = getAllSyncKeys();
-    const rows = keys.map(k => ({ user_id: syncUid, key: k, value: LS_get(k) }));
-    const { error } = await supaClient.from('dashboard_sync').upsert(rows, { onConflict: 'user_id,key' });
-    if (error) { console.warn('Push failed:', error.message); setStatus('disconnected','Sync failed'); }
-    else setStatus('connected','Synced '+ new Date().toLocaleTimeString('en-AU',{hour:'2-digit',minute:'2-digit'}));
+    setStatus('syncing', 'Pushing\u2026');
+    var keys = getAllSyncKeys();
+    var rows = keys.map(function(k) { return { user_id: syncUid, key: k, value: LS_get(k) }; });
+    var res = await supaClient.from('dashboard_sync').upsert(rows, { onConflict: 'user_id,key' });
+    if (res.error) {
+      console.warn('pushAll failed:', res.error.message);
+      setStatus('disconnected', 'Sync failed');
+    } else {
+      setStatus('connected', 'Synced ' + new Date().toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit' }));
+    }
   }
 
   async function pullAll() {
     if (!supaClient || !syncUid) return;
-    setStatus('syncing','Pulling…');
-    const { data, error } = await supaClient.from('dashboard_sync').select('key,value,updated_at').eq('user_id',syncUid);
-    if (error) { console.warn('Pull failed:', error.message); setStatus('disconnected','Pull failed'); return; }
-    (data||[]).forEach(row => {
-      const local = LS_get(row.key);
-      // Simple last-write-wins: remote wins if local is null, otherwise keep local (user is primary device)
-      if (local === null) LS_set(row.key, row.value);
+    setStatus('syncing', 'Pulling\u2026');
+    var res = await supaClient.from('dashboard_sync')
+      .select('key,value,updated_at').eq('user_id', syncUid);
+    if (res.error) {
+      console.warn('pullAll failed:', res.error.message);
+      setStatus('disconnected', 'Pull failed');
+      return;
+    }
+    var data = res.data || [];
+    if (data.length === 0) {
+      // Nothing in remote yet — push local data up
+      await pushAll();
+      return;
+    }
+    // Remote wins: write all remote values directly (bypass push wrapper)
+    isPulling = true;
+    data.forEach(function(row) {
+      if (row.value !== undefined && row.value !== null) {
+        lsWriteRaw(row.key, row.value);
+      }
     });
-    setStatus('connected','Synced');
-    // Re-render everything
-    if (typeof renderHealth==='function') renderHealth();
-    if (typeof renderStudy==='function') renderStudy();
-    if (typeof renderCountdowns==='function') renderCountdowns();
+    isPulling = false;
+    setStatus('connected', 'Synced ' + new Date().toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit' }));
+    reRenderAll();
   }
 
   function subscribeRealtime() {
     if (!supaClient || !syncUid) return;
-    if (realtimeSub) supaClient.removeChannel(realtimeSub);
-    realtimeSub = supaClient.channel('dashboard-sync')
-      .on('postgres_changes', { event:'*', schema:'public', table:'dashboard_sync', filter:`user_id=eq.${syncUid}` }, payload => {
-        const { key, value } = payload.new || {};
-        if (key && value !== undefined) { LS_set(key, value); }
-        // Light re-render on remote change
-        if (typeof renderHealth==='function') renderHealth();
-        if (typeof renderStudy==='function') renderStudy();
+    if (realtimeSub) { try { supaClient.removeChannel(realtimeSub); } catch(e) {} }
+    realtimeSub = supaClient
+      .channel('dashboard-sync-' + syncUid)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'dashboard_sync',
+        filter: 'user_id=eq.' + syncUid
+      }, function(payload) {
+        if (!payload.new) return;
+        var key = payload.new.key;
+        var value = payload.new.value;
+        if (!key || value === undefined) return;
+        isPulling = true;
+        lsWriteRaw(key, value);
+        isPulling = false;
+        reRenderAll();
+        setStatus('connected', 'Updated ' + new Date().toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit' }));
       })
       .subscribe();
   }
 
-  // Debounced push on any localStorage write — wraps window.LS_set
-  const _origLS = window.LS_set;
-  window.LS_set = function(k, v) {
-    _origLS(k, v);
-    if (!supaClient || !syncUid) return;
+  // Intercept LS_set — since LS_set is `let`, reassigning here affects all closures
+  var _rawLS = LS_set;
+  LS_set = function(k, v) {
+    _rawLS(k, v);
+    if (!supaClient || !syncUid || isPulling) return;
     clearTimeout(pushTimer);
-    pushTimer = setTimeout(() => {
-      supaClient.from('dashboard_sync').upsert([{ user_id: syncUid, key: k, value: window.LS_get(k) }], { onConflict:'user_id,key' })
-        .then(({error}) => { if(!error) setStatus('connected','Synced '+new Date().toLocaleTimeString('en-AU',{hour:'2-digit',minute:'2-digit'})); });
-    }, 1200);
+    pushTimer = setTimeout(function() {
+      pushKey(k).then(function() {
+        setStatus('connected', 'Synced ' + new Date().toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit' }));
+      });
+    }, 1500);
   };
 
   // Settings modal
-  document.getElementById('settingsBtn').addEventListener('click', () => {
-    const cfg = getConfig();
-    document.getElementById('supa_url').value = cfg.url||'';
-    document.getElementById('supa_key').value = cfg.key||'';
-    document.getElementById('supa_uid').value = cfg.uid||'';
+  document.getElementById('settingsBtn').addEventListener('click', function() {
+    var cfg = getConfig();
+    document.getElementById('supa_url').value = cfg.url || '';
+    document.getElementById('supa_key').value = cfg.key || '';
+    document.getElementById('supa_uid').value = cfg.uid || '';
     document.getElementById('settingsModal').classList.add('open');
   });
-  document.getElementById('settingsModal').addEventListener('click', e => {
-    if (e.target === document.getElementById('settingsModal')) document.getElementById('settingsModal').classList.remove('open');
+  document.getElementById('settingsModal').addEventListener('click', function(e) {
+    if (e.target === document.getElementById('settingsModal'))
+      document.getElementById('settingsModal').classList.remove('open');
   });
-  document.getElementById('supaSaveBtn').addEventListener('click', async () => {
-    const url = document.getElementById('supa_url').value.trim();
-    const key = document.getElementById('supa_key').value.trim();
-    const uid = document.getElementById('supa_uid').value.trim();
-    if (!url||!key||!uid) return alert('Fill in all three fields.');
-    LS_set('supa:config', { url, key, uid });
-    const ok = await initSupabase(url, key, uid);
-    if (ok) { subscribeRealtime(); await pullAll(); document.getElementById('settingsModal').classList.remove('open'); }
-    else alert('Connection failed — check your URL and anon key.');
+  document.getElementById('supaSaveBtn').addEventListener('click', async function() {
+    var url = document.getElementById('supa_url').value.trim();
+    var key = document.getElementById('supa_key').value.trim();
+    var uid = document.getElementById('supa_uid').value.trim();
+    if (!url || !key || !uid) { alert('Fill in all three fields.'); return; }
+    LS_set('supa:config', { url: url, key: key, uid: uid });
+    var ok = await initSupabase(url, key, uid);
+    if (!ok) { alert('Connection failed \u2014 check your URL and anon key.'); return; }
+    subscribeRealtime();
+    await pullAll();
+    document.getElementById('settingsModal').classList.remove('open');
   });
-  document.getElementById('supaDisconnectBtn').addEventListener('click', () => {
+  document.getElementById('supaDisconnectBtn').addEventListener('click', function() {
     localStorage.removeItem('supa:config');
-    supaClient = null; syncUid = null;
-    if (realtimeSub) { try { supaClient && supaClient.removeChannel(realtimeSub); } catch{} }
-    setStatus('disconnected','Offline');
+    if (realtimeSub) { try { supaClient.removeChannel(realtimeSub); } catch(e) {} }
+    supaClient = null; syncUid = null; realtimeSub = null;
+    setStatus('disconnected', 'Offline');
     document.getElementById('settingsModal').classList.remove('open');
   });
 
-  // Auto-init on load if config exists
+  // Auto-reconnect if credentials already saved
   (function() {
-    const cfg = getConfig();
+    var cfg = getConfig();
     if (cfg.url && cfg.key && cfg.uid) {
       initSupabase(cfg.url, cfg.key, cfg.uid).then(function(ok) {
         if (ok) { subscribeRealtime(); pullAll(); }
@@ -2293,7 +2344,7 @@ function fmtMoney(amountCHF) {
     }
   })();
 
-  window.pcSupa = () => supaClient;
+  window.pcSupa = function() { return supaClient; };
   window.pcSchedulePush = pushAll;
 })();
 
