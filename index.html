@@ -2266,7 +2266,11 @@ function fmtMoney(amountCHF) {
     if (!supaClient || !syncUid) return;
     setStatus('syncing', 'Pushing\u2026');
     var keys = getAllSyncKeys();
-    var rows = keys.map(function(k) { return { user_id: syncUid, key: k, value: LS_get(k) }; });
+    // Only push keys that actually have data — never push nulls
+    var rows = keys
+      .filter(function(k) { return LS_get(k) !== null; })
+      .map(function(k) { return { user_id: syncUid, key: k, value: LS_get(k) }; });
+    if (rows.length === 0) { setStatus('connected', 'Nothing to push'); return; }
     var res = await supaClient.from('dashboard_sync').upsert(rows, { onConflict: 'user_id,key' });
     if (res.error) {
       console.warn('pushAll failed:', res.error.message);
@@ -2278,28 +2282,43 @@ function fmtMoney(amountCHF) {
 
   async function pullAll() {
     if (!supaClient || !syncUid) return;
-    setStatus('syncing', 'Pulling\u2026');
+    setStatus('syncing', 'Syncing\u2026');
+
     var res = await supaClient.from('dashboard_sync')
-      .select('key,value,updated_at').eq('user_id', syncUid);
+      .select('key,value').eq('user_id', syncUid);
+
     if (res.error) {
       console.warn('pullAll failed:', res.error.message);
       setStatus('disconnected', 'Pull failed');
       return;
     }
-    var data = res.data || [];
-    if (data.length === 0) {
-      // Nothing in remote yet — push local data up
-      await pushAll();
-      return;
-    }
-    // Remote wins: write all remote values directly (bypass push wrapper)
+
+    var remoteRows = res.data || [];
+    var remoteKeySet = new Set(remoteRows.map(function(r) { return r.key; }));
+
+    // Step 1: Remote wins — write all remote values to localStorage directly
+    // (bypasses the LS_set push interceptor so this doesn't trigger re-uploads)
     isPulling = true;
-    data.forEach(function(row) {
-      if (row.value !== undefined && row.value !== null) {
+    remoteRows.forEach(function(row) {
+      if (row.value !== null && row.value !== undefined) {
         lsWriteRaw(row.key, row.value);
       }
     });
     isPulling = false;
+
+    // Step 2: Upload any local keys that don't exist in Supabase yet
+    // (first-time sync, or new data added offline on this device)
+    var localKeys = getAllSyncKeys();
+    var newRows = localKeys
+      .filter(function(k) { return !remoteKeySet.has(k) && LS_get(k) !== null; })
+      .map(function(k) { return { user_id: syncUid, key: k, value: LS_get(k) }; });
+
+    if (newRows.length > 0) {
+      var pushRes = await supaClient.from('dashboard_sync')
+        .upsert(newRows, { onConflict: 'user_id,key' });
+      if (pushRes.error) console.warn('pullAll push-new failed:', pushRes.error.message);
+    }
+
     setStatus('connected', 'Synced ' + new Date().toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit' }));
     reRenderAll();
   }
@@ -2328,11 +2347,16 @@ function fmtMoney(amountCHF) {
       .subscribe();
   }
 
+  // Suppress push for the first 5 seconds after load — lets pullAll complete
+  // before any module-init LS_set calls can trigger an overwriting push
+  var startupGrace = true;
+  setTimeout(function() { startupGrace = false; }, 5000);
+
   // Intercept LS_set — since LS_set is `let`, reassigning here affects all closures
   var _rawLS = LS_set;
   LS_set = function(k, v) {
     _rawLS(k, v);
-    if (!supaClient || !syncUid || isPulling) return;
+    if (!supaClient || !syncUid || isPulling || startupGrace) return;
     clearTimeout(pushTimer);
     pushTimer = setTimeout(function() {
       pushKey(k).then(function() {
