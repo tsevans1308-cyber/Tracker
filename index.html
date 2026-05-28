@@ -655,7 +655,8 @@ body::after {
       <div class="modal-section" style="margin-top:20px">
         <div class="modal-label">Supabase Table SQL</div>
         <div class="modal-sub" style="margin-bottom:0">Run this once in your Supabase SQL editor:</div>
-        <div class="modal-sql">create table if not exists dashboard_sync (
+        <div class="modal-sql">-- 1. Create the table
+create table if not exists dashboard_sync (
   id          uuid primary key default gen_random_uuid(),
   user_id     text not null,
   key         text not null,
@@ -664,17 +665,22 @@ body::after {
   unique (user_id, key)
 );
 
-alter table dashboard_sync enable row level security;
+-- 2. Grant full access to the anon key (personal app, no auth needed)
+grant select, insert, update, delete on dashboard_sync to anon;
+grant select, insert, update, delete on dashboard_sync to authenticated;
 
-create policy "users own their data" on dashboard_sync
-  for all using (true) with check (true);
+-- 3. Disable RLS — simplest for a single-user personal dashboard
+alter table dashboard_sync disable row level security;
 
+-- 4. Auto-update timestamp on every write
 create or replace function set_updated_at()
 returns trigger language plpgsql as $$
 begin new.updated_at = now(); return new; end; $$;
 
+drop trigger if exists trg_updated_at on dashboard_sync;
 create trigger trg_updated_at before update on dashboard_sync
   for each row execute procedure set_updated_at();</div>
+        <div class="modal-sub" style="margin-top:8px;color:var(--danger)">⚠️ If you previously ran the old SQL, also run:<br><code style="font-family:var(--font-mono);font-size:10px">alter table dashboard_sync disable row level security;</code></div>
       </div>
     </div>
   </div>
@@ -2203,15 +2209,20 @@ function fmtMoney(amountCHF) {
       supaClient = supabase.createClient(url, key);
       syncUid = uid;
       setStatus('syncing', 'Connecting\u2026');
-      var res = await supaClient.from('dashboard_sync').select('key').eq('user_id', uid).limit(1);
-      if (res.error) throw res.error;
+      // Test both read AND write — a read-only success can mask RLS blocking writes
+      var testKey = '__conn_test__';
+      var writeRes = await supaClient.from('dashboard_sync')
+        .upsert([{ user_id: uid, key: testKey, value: true }], { onConflict: 'user_id,key' });
+      if (writeRes.error) throw new Error('Write blocked: ' + writeRes.error.message + ' — check RLS/grants (see SQL in settings)');
+      // Clean up test row
+      await supaClient.from('dashboard_sync').delete().eq('user_id', uid).eq('key', testKey);
       setStatus('connected', 'Connected');
       return true;
     } catch(e) {
       console.warn('Supabase init failed:', e.message);
-      setStatus('disconnected', 'Offline');
+      setStatus('disconnected', 'Failed');
       supaClient = null;
-      return false;
+      return e.message; // return message so caller can show it
     }
   }
 
@@ -2320,8 +2331,12 @@ function fmtMoney(amountCHF) {
     var uid = document.getElementById('supa_uid').value.trim();
     if (!url || !key || !uid) { alert('Fill in all three fields.'); return; }
     LS_set('supa:config', { url: url, key: key, uid: uid });
-    var ok = await initSupabase(url, key, uid);
-    if (!ok) { alert('Connection failed \u2014 check your URL and anon key.'); return; }
+    var result = await initSupabase(url, key, uid);
+    if (result !== true) {
+      var msg = typeof result === 'string' ? result : 'Connection failed — check your URL and anon key.';
+      alert(msg);
+      return;
+    }
     subscribeRealtime();
     await pullAll();
     document.getElementById('settingsModal').classList.remove('open');
@@ -2338,8 +2353,9 @@ function fmtMoney(amountCHF) {
   (function() {
     var cfg = getConfig();
     if (cfg.url && cfg.key && cfg.uid) {
-      initSupabase(cfg.url, cfg.key, cfg.uid).then(function(ok) {
-        if (ok) { subscribeRealtime(); pullAll(); }
+      initSupabase(cfg.url, cfg.key, cfg.uid).then(function(result) {
+        if (result === true) { subscribeRealtime(); pullAll(); }
+        else { setStatus('disconnected', 'Offline'); }
       });
     }
   })();
