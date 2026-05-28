@@ -2164,7 +2164,17 @@ function fmtMoney(amountCHF) {
   var pushTimer = null;
   var isPulling = false;
 
-  function getConfig() { return LS_get('supa:config') || {}; }
+  // Credentials stored directly in localStorage — never routed through LS_set override
+  // so the Supabase push interceptor can never interfere with them
+  function getConfig() {
+    try { return JSON.parse(localStorage.getItem('supa:config')) || {}; } catch(e) { return {}; }
+  }
+  function saveConfig(cfg) {
+    try { localStorage.setItem('supa:config', JSON.stringify(cfg)); } catch(e) {}
+  }
+  function clearConfig() {
+    try { localStorage.removeItem('supa:config'); } catch(e) {}
+  }
 
   function setStatus(state, text) {
     var el = document.getElementById('supaStatus');
@@ -2202,6 +2212,26 @@ function fmtMoney(amountCHF) {
     });
   }
 
+  // Lightweight connect — used on page load auto-reconnect
+  // Only tests that the table is reachable, doesn't do a write test
+  async function connectSupabase(url, key, uid) {
+    if (!url || !key || !uid) return false;
+    try {
+      await loadSDK();
+      supaClient = supabase.createClient(url, key);
+      syncUid = uid;
+      var res = await supaClient.from('dashboard_sync').select('key').eq('user_id', uid).limit(1);
+      if (res.error) throw res.error;
+      return true;
+    } catch(e) {
+      console.warn('Auto-reconnect failed:', e.message);
+      supaClient = null; syncUid = null;
+      return false;
+    }
+  }
+
+  // Full connect — used when user manually hits "Connect & Sync"
+  // Tests write permissions so misconfigured RLS is caught immediately
   async function initSupabase(url, key, uid) {
     if (!url || !key || !uid) return false;
     try {
@@ -2209,20 +2239,18 @@ function fmtMoney(amountCHF) {
       supaClient = supabase.createClient(url, key);
       syncUid = uid;
       setStatus('syncing', 'Connecting\u2026');
-      // Test both read AND write — a read-only success can mask RLS blocking writes
       var testKey = '__conn_test__';
       var writeRes = await supaClient.from('dashboard_sync')
         .upsert([{ user_id: uid, key: testKey, value: true }], { onConflict: 'user_id,key' });
       if (writeRes.error) throw new Error('Write blocked: ' + writeRes.error.message + ' — check RLS/grants (see SQL in settings)');
-      // Clean up test row
       await supaClient.from('dashboard_sync').delete().eq('user_id', uid).eq('key', testKey);
       setStatus('connected', 'Connected');
       return true;
     } catch(e) {
       console.warn('Supabase init failed:', e.message);
       setStatus('disconnected', 'Failed');
-      supaClient = null;
-      return e.message; // return message so caller can show it
+      supaClient = null; syncUid = null;
+      return e.message;
     }
   }
 
@@ -2330,7 +2358,8 @@ function fmtMoney(amountCHF) {
     var key = document.getElementById('supa_key').value.trim();
     var uid = document.getElementById('supa_uid').value.trim();
     if (!url || !key || !uid) { alert('Fill in all three fields.'); return; }
-    LS_set('supa:config', { url: url, key: key, uid: uid });
+    // Save credentials first — before any async work so they always persist
+    saveConfig({ url: url, key: key, uid: uid });
     var result = await initSupabase(url, key, uid);
     if (result !== true) {
       var msg = typeof result === 'string' ? result : 'Connection failed — check your URL and anon key.';
@@ -2342,22 +2371,27 @@ function fmtMoney(amountCHF) {
     document.getElementById('settingsModal').classList.remove('open');
   });
   document.getElementById('supaDisconnectBtn').addEventListener('click', function() {
-    localStorage.removeItem('supa:config');
-    if (realtimeSub) { try { supaClient.removeChannel(realtimeSub); } catch(e) {} }
+    clearConfig();
+    if (realtimeSub && supaClient) { try { supaClient.removeChannel(realtimeSub); } catch(e) {} }
     supaClient = null; syncUid = null; realtimeSub = null;
     setStatus('disconnected', 'Offline');
     document.getElementById('settingsModal').classList.remove('open');
   });
 
-  // Auto-reconnect if credentials already saved
+  // Auto-reconnect on page load — uses lightweight connect, not write test
   (function() {
     var cfg = getConfig();
-    if (cfg.url && cfg.key && cfg.uid) {
-      initSupabase(cfg.url, cfg.key, cfg.uid).then(function(result) {
-        if (result === true) { subscribeRealtime(); pullAll(); }
-        else { setStatus('disconnected', 'Offline'); }
-      });
-    }
+    if (!cfg.url || !cfg.key || !cfg.uid) return;
+    setStatus('syncing', 'Reconnecting\u2026');
+    connectSupabase(cfg.url, cfg.key, cfg.uid).then(function(ok) {
+      if (ok) {
+        setStatus('syncing', 'Pulling\u2026');
+        subscribeRealtime();
+        pullAll();
+      } else {
+        setStatus('disconnected', 'Reconnect failed \u2014 open \u2699\ufe0f to retry');
+      }
+    });
   })();
 
   window.pcSupa = function() { return supaClient; };
